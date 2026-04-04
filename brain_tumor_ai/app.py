@@ -56,7 +56,7 @@ def run_analysis(mri_files: List[Any], theme: str) -> Tuple[Any, Any, str]:
         image_path = generate_2d_views(data, mask)
         
         # Plotly figure for 3D interaction
-        plot_3d_figure = generate_3d_plot(data[0], theme)
+        plot_3d_figure = generate_3d_plot(data, mask, theme)
         
         # Generate final formatted report
         report_text = generate_report(results)
