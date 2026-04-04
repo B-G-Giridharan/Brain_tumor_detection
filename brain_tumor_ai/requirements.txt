@@ -1,0 +1,10 @@
+# Production requirements for Brain Tumor Analysis AI
+gradio>=4.0.0
+numpy>=1.24.0
+torch>=2.0.0
+monai>=1.2.0
+matplotlib>=3.7.0
+plotly>=5.15.0
+pandas>=2.0.0
+scipy>=1.11.0
+python-logging-discord-handler  # Example of extensibility
