@@ -1,32 +1,59 @@
-"""Stable 3D Interactive visualization for brain MRI using Scatter3d point cloud.
+"""Professional 3D brain + tumor surface rendering using Marching Cubes + Mesh3d.
 
-Uses go.Scatter3d for reliable cross-environment rendering.
-Brain is shown as a semi-transparent point cloud; tumor as a dense red cluster.
+Replaces point-cloud approach with smooth ISO-surface extraction for
+medical-grade, publication-quality 3D visualization.
 """
 
 import logging
-import plotly.graph_objects as go
+from typing import Optional
 import numpy as np
-from scipy.ndimage import zoom
+import plotly.graph_objects as go
+from scipy.ndimage import zoom, gaussian_filter
 
 logger = logging.getLogger(__name__)
 
+# ── lazy import so the module still loads if skimage is missing ──────────────
+try:
+    from skimage.measure import marching_cubes
+    _HAS_SKIMAGE = True
+except ImportError:
+    _HAS_SKIMAGE = False
+    logger.warning("scikit-image not found — 3D mesh unavailable, using scatter fallback.")
 
-def generate_3d_plot(mri_data: np.ndarray, mask: np.ndarray, theme: str = "grayscale") -> go.Figure:
-    """Generates a stable, interactive 3D brain + tumor point-cloud visualization.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_3d_plot(
+    mri_data: np.ndarray,
+    mask: np.ndarray,
+    theme: str = "grayscale",
+) -> go.Figure:
+    """Generate a smooth-surface 3D brain + tumor visualization.
 
     Args:
-        mri_data (np.ndarray): Multi-modal MRI scan of shape (4, H, W, D).
-        mask (np.ndarray): Binary segmentation mask — any shape (H_m, W_m, D_m).
-        theme (str): Visual color theme ('grayscale', 'thermal', 'rainbow', 'plasma').
+        mri_data: Multi-modal MRI of shape (4, H, W, D).
+        mask:     Binary segmentation mask, any resolution.
+        theme:    Color theme: 'grayscale' | 'thermal' | 'rainbow' | 'plasma'.
 
     Returns:
-        go.Figure: A Plotly Figure with brain point cloud and tumor overlay.
+        Interactive Plotly Figure with Mesh3d surfaces.
     """
-    logger.info(f"Generating stable 3D point cloud (Theme: {theme})")
+    if _HAS_SKIMAGE:
+        return _mesh_pipeline(mri_data, mask, theme)
+    else:
+        return _scatter_fallback(mri_data, mask, theme)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Marching-Cubes Mesh Pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _mesh_pipeline(mri_data, mask, theme):
+    logger.info(f"Marching-Cubes 3D render — theme={theme}")
     try:
-        # ── Step 1: Input Validation ──────────────────────────────────────────
+        # ── 1. Validate ───────────────────────────────────────────────────────
         if mri_data is None:
             raise ValueError("MRI data is None")
         if mask is None:
@@ -34,133 +61,184 @@ def generate_3d_plot(mri_data: np.ndarray, mask: np.ndarray, theme: str = "grays
 
         brain = mri_data[0].astype("float32")
 
-        # ── Step 2: Normalize [0, 1] ──────────────────────────────────────────
+        # ── 2. Normalize ──────────────────────────────────────────────────────
         brain = (brain - brain.min()) / (brain.max() - brain.min() + 1e-8)
 
-        # ── Step 3: Downsample (3x stride = 27x fewer voxels for 60fps) ───────
-        brain_ds = brain[::3, ::3, ::3]
+        # ── 3. Downsample 2× for performance ──────────────────────────────────
+        brain_ds = brain[::2, ::2, ::2]
 
-        # ── Step 4: Align mask to brain_ds via zoom (handles resolution diff) ─
-        target_shape = brain_ds.shape
-        mask_float = mask.astype("float32")
-
-        if mask_float.shape != target_shape:
-            zf = (
-                target_shape[0] / mask_float.shape[0],
-                target_shape[1] / mask_float.shape[1],
-                target_shape[2] / mask_float.shape[2],
-            )
-            mask_ds = zoom(mask_float, zf, order=0)
-            logger.info(f"Mask resampled {mask_float.shape} → {mask_ds.shape}")
+        # Align mask resolution → brain_ds shape
+        target = brain_ds.shape
+        mask_f = mask.astype("float32")
+        if mask_f.shape != target:
+            zf = tuple(t / s for t, s in zip(target, mask_f.shape))
+            mask_ds = zoom(mask_f, zf, order=0)
+            logger.info(f"Mask resampled {mask_f.shape} → {mask_ds.shape}")
         else:
-            mask_ds = mask_float
+            mask_ds = mask_f
 
-        # ── Step 5: Build coordinate grid ─────────────────────────────────────
-        h, w, d = brain_ds.shape
-        grid_x, grid_y, grid_z = np.mgrid[0:h, 0:w, 0:d]
+        # Make mask strictly binary
+        mask_ds = (mask_ds > 0.5).astype("float32")
 
-        # ── Step 6: Flatten ───────────────────────────────────────────────────
-        x            = grid_x.flatten()
-        y            = grid_y.flatten()
-        z            = grid_z.flatten()
-        brain_values = brain_ds.flatten()
-        mask_values  = mask_ds.flatten()
+        # ── 4. Smooth brain slightly for nicer surface ─────────────────────────
+        brain_smooth = gaussian_filter(brain_ds, sigma=1.0)
 
-        print(f"[3D] Shapes — x:{x.shape} brain:{brain_values.shape} mask:{mask_values.shape}")
+        # ── 5. Extract brain surface (Marching Cubes) ─────────────────────────
+        brain_level = 0.25   # Isovalue — tune 0.15-0.35 to expose more/less tissue
+        verts, faces, normals, _ = marching_cubes(brain_smooth, level=brain_level,
+                                                   allow_degenerate=False)
+        print(f"[3D Mesh] Brain — verts:{len(verts):,}  faces:{len(faces):,}")
 
-        # ── Step 7: Filter background air voxels (keep brain tissue only) ─────
-        threshold = 0.15
-        brain_sel = brain_values > threshold
-        x_brain   = x[brain_sel]
-        y_brain   = y[brain_sel]
-        z_brain   = z[brain_sel]
-        brain_fil = brain_values[brain_sel]
+        # ── 6. Brain mesh colour by theme ─────────────────────────────────────
+        theme_color = {
+            "grayscale": ("lightgray",   "#999999"),
+            "thermal":   ("lightsalmon", "#FF8C69"),
+            "rainbow":   ("lightblue",   "#87CEFA"),
+            "plasma":    ("mediumpurple","#9370DB"),
+        }.get(theme, ("lightgray", "#AAAAAA"))
 
-        # ── Step 8: Filter tumor voxels ───────────────────────────────────────
-        tumor_sel = mask_values > 0
-        x_tumor   = x[tumor_sel]
-        y_tumor   = y[tumor_sel]
-        z_tumor   = z[tumor_sel]
-
-        print(f"[3D] Points — brain:{len(x_brain):,}  tumor:{len(x_tumor):,}")
-
-        # ── Step 9: Theme → colorscale mapping ───────────────────────────────
-        colorscale_map = {
-            "grayscale": "gray",
-            "thermal":   "hot",
-            "rainbow":   "rainbow",
-            "plasma":    "plasma",
-        }
-        brain_colorscale = colorscale_map.get(theme, "blues")
-
-        # ── Step 10: Traces ───────────────────────────────────────────────────
-        brain_trace = go.Scatter3d(
-            x=x_brain, y=y_brain, z=z_brain,
-            mode="markers",
-            marker=dict(
-                size=2,
-                color=brain_fil,
-                colorscale=brain_colorscale,
-                cmin=0.15,
-                cmax=1.0,
-                opacity=0.35,       # increased from 0.08 → visible on white bg
-                showscale=True,
-                colorbar=dict(
-                    title=dict(text="Intensity", font=dict(color="black")),
-                    thickness=12,
-                    tickfont=dict(color="black"),
-                    x=1.02,
-                ),
+        brain_mesh = go.Mesh3d(
+            x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
+            i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+            color=theme_color[0],
+            opacity=0.25,
+            flatshading=False,
+            lighting=dict(
+                ambient=0.5,
+                diffuse=0.8,
+                specular=0.4,
+                roughness=0.4,
+                fresnel=0.2,
             ),
+            lightposition=dict(x=100, y=200, z=150),
             name="Brain",
+            showlegend=True,
         )
 
-        traces = [brain_trace]
+        # ── 7. Extract tumor surface ───────────────────────────────────────────
+        traces = [brain_mesh]
 
-        if len(x_tumor) > 0:
-            tumor_trace = go.Scatter3d(
-                x=x_tumor, y=y_tumor, z=z_tumor,
-                mode="markers",
-                marker=dict(size=4, color="red", opacity=0.85),
-                name="Tumor",
-            )
-            traces.append(tumor_trace)
+        if mask_ds.max() > 0:
+            try:
+                # Smooth mask slightly to get rounded tumor surface
+                mask_smooth = gaussian_filter(mask_ds, sigma=0.8)
+                t_verts, t_faces, _, _ = marching_cubes(mask_smooth, level=0.5,
+                                                         allow_degenerate=False)
+                print(f"[3D Mesh] Tumor — verts:{len(t_verts):,}  faces:{len(t_faces):,}")
 
-        # ── Step 11: Assemble figure ──────────────────────────────────────────
+                tumor_mesh = go.Mesh3d(
+                    x=t_verts[:, 0], y=t_verts[:, 1], z=t_verts[:, 2],
+                    i=t_faces[:, 0], j=t_faces[:, 1], k=t_faces[:, 2],
+                    color="red",
+                    opacity=0.85,
+                    flatshading=False,
+                    lighting=dict(
+                        ambient=0.4,
+                        diffuse=0.8,
+                        specular=0.6,
+                        roughness=0.3,
+                    ),
+                    lightposition=dict(x=100, y=200, z=150),
+                    name="Tumor",
+                    showlegend=True,
+                )
+                traces.append(tumor_mesh)
+            except Exception as te:
+                logger.warning(f"Tumor surface extraction failed: {te}")
+
+        # ── 8. Assemble and layout ─────────────────────────────────────────────
         fig = go.Figure(data=traces)
-
-        # ── Step 12: Layout (white background, matches 2D slide style) ────────
-        fig.update_layout(
-            title={
-                "text": f"3D Brain Tumor Visualization ({theme.capitalize()} Theme)",
-                "x": 0.5,
-                "xanchor": "center",
-                "font": {"color": "black", "size": 18, "family": "Arial"},
-            },
-            paper_bgcolor="white",          # outer canvas → white
-            plot_bgcolor="white",
-            scene=dict(
-                xaxis=dict(visible=False, backgroundcolor="white"),
-                yaxis=dict(visible=False, backgroundcolor="white"),
-                zaxis=dict(visible=False, backgroundcolor="white"),
-                bgcolor="white",            # 3D scene → white
-            ),
-            margin=dict(l=0, r=60, t=60, b=0),
-            height=600,
-            legend=dict(
-                font=dict(color="black", size=13),
-                bgcolor="rgba(255,255,255,0.85)",
-                bordercolor="rgba(0,0,0,0.2)",
-                borderwidth=1,
-            ),
-        )
-
-        logger.info(f"3D done: {len(x_brain):,} brain, {len(x_tumor):,} tumor pts.")
+        _apply_layout(fig, theme)
+        logger.info("Mesh3d figure built successfully.")
         return fig
 
     except Exception as e:
-        logger.error(f"3D Visualization Error: {e}")
-        print(f"3D Visualization Error: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"Mesh pipeline error: {e}")
+        print(f"[3D Mesh Error] {e}")
+        import traceback; traceback.print_exc()
         return go.Figure()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scatter3d fallback (no scikit-image)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _scatter_fallback(mri_data, mask, theme):
+    """Lightweight point-cloud fallback when skimage is unavailable."""
+    logger.info("Using Scatter3d fallback (scikit-image not installed)")
+    try:
+        brain = mri_data[0].astype("float32")
+        brain = (brain - brain.min()) / (brain.max() - brain.min() + 1e-8)
+        brain_ds = brain[::3, ::3, ::3]
+
+        target = brain_ds.shape
+        mask_f = mask.astype("float32")
+        if mask_f.shape != target:
+            zf = tuple(t / s for t, s in zip(target, mask_f.shape))
+            mask_ds = zoom(mask_f, zf, order=0)
+        else:
+            mask_ds = mask_f
+
+        h, w, d = brain_ds.shape
+        gx, gy, gz = np.mgrid[0:h, 0:w, 0:d]
+        x, y, z = gx.flatten(), gy.flatten(), gz.flatten()
+        bv = brain_ds.flatten()
+        mv = mask_ds.flatten()
+
+        sel = bv > 0.15
+        cs_map = {"grayscale":"gray","thermal":"hot","rainbow":"rainbow","plasma":"plasma"}
+        brain_trace = go.Scatter3d(
+            x=x[sel], y=y[sel], z=z[sel], mode="markers",
+            marker=dict(size=2, color=bv[sel],
+                        colorscale=cs_map.get(theme,"gray"), opacity=0.12),
+            name="Brain",
+        )
+        traces = [brain_trace]
+        tsel = mv > 0
+        if tsel.any():
+            traces.append(go.Scatter3d(
+                x=x[tsel], y=y[tsel], z=z[tsel], mode="markers",
+                marker=dict(size=4, color="red", opacity=0.85),
+                name="Tumor",
+            ))
+        fig = go.Figure(data=traces)
+        _apply_layout(fig, theme)
+        return fig
+    except Exception as e:
+        print(f"[Scatter Fallback Error] {e}")
+        return go.Figure()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared layout
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _apply_layout(fig: go.Figure, theme: str) -> None:
+    fig.update_layout(
+        title={
+            "text": f"3D Brain Tumor Visualization ({theme.capitalize()} Theme)",
+            "x": 0.5,
+            "xanchor": "center",
+            "font": {"color": "black", "size": 18, "family": "Arial, sans-serif"},
+        },
+        paper_bgcolor="white",
+        scene=dict(
+            xaxis=dict(visible=False, backgroundcolor="white"),
+            yaxis=dict(visible=False, backgroundcolor="white"),
+            zaxis=dict(visible=False, backgroundcolor="white"),
+            bgcolor="white",
+            camera=dict(
+                eye=dict(x=1.5, y=1.5, z=1.2),
+                up=dict(x=0, y=0, z=1),
+            ),
+            aspectmode="data",  # preserve real proportions
+        ),
+        margin=dict(l=0, r=0, t=60, b=0),
+        height=620,
+        legend=dict(
+            font=dict(color="black", size=13),
+            bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="rgba(0,0,0,0.15)",
+            borderwidth=1,
+        ),
+    )
